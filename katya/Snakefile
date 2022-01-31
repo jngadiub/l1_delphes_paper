@@ -1,0 +1,250 @@
+configfile: 'config.yaml'
+
+
+IDS = {
+    'hToTauTau_13TeV_PU20': [i for i in range(0,100) if i not in [27, 43, 92]],
+    'hChToTauNu_13TeV_PU20': [i for i in range(0,100) if i not in [1, 8, 37, 45, 64, 86, 95, 97]]
+}
+
+rule merge_h5_tuples:
+    ''' Merge all converted to h5 format tuples into one file '''
+    input:
+        script = 'merge_h5_tuples.py',
+        input_files = lambda wildcards: expand('/eos/project/d/dshep/L1anomaly_DELPHES/{bsm}/{bsm}_{id}.h5', id=IDS[wildcards.bsm], bsm='{bsm}')
+    output:
+        file = 'output/{bsm}.h5'
+    shell:
+        'python {input.script} --input-files {input.input_files} \
+                               --output-file {output.file}'
+
+rule merge_h5_bsm:
+    input:
+        expand(rules.merge_h5_tuples.output.file, bsm=['hToTauTau_13TeV_PU20', 'hChToTauNu_13TeV_PU20'])
+
+rule prepare_data:
+    ''' Prepare data for training'''
+    input:
+        script = 'prepare_data.py',
+        qcd = config['background'],
+    output:
+        'output/data_{events}.pickle'
+    params:
+        leptoquarks = config['leptoquarks'],
+        ato4l = config['ato4l'],
+        hChToTauNu = config['hChToTauNu'],
+        hToTauTau = config['hToTauTau']
+    shell:
+        'python {input.script} --output-file {output} \
+                               --input-file {input.qcd} \
+                               --events {wildcards.events} \
+                               --input-bsm {params.leptoquarks} \
+                               --input-bsm {params.ato4l} \
+                               --input-bsm {params.hChToTauNu} \
+                               --input-bsm {params.hToTauTau} '
+
+rule train:
+    ''' Train specified model, save result in h5 file '''
+    input:
+    output:
+        h5 = 'output/model-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.h5',
+        json = 'output/model-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.json',
+        history = 'output/history-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.pickle'
+    shell:
+        'python train.py --output-model-h5 {output.h5} \
+                         --output-model-json {output.json} \
+                         --output-history {output.history} \
+                         --batch-size 1024 \
+                         --quant-size {wildcards.quant_size} \
+                         --n-epochs 100 \
+                         --pruning {wildcards.pruning} \
+                         --latent-dim {wildcards.latent_dim} \
+                         --model-type {wildcards.model} \
+                         --beta {wildcards.beta}'
+
+rule evaluate:
+    input:
+        script = 'evaluate.py',
+        data = expand(rules.prepare_data.output, events=-1),
+        h5 = 'output/model-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.h5',
+        json = 'output/model-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.json',
+        history = 'output/history-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.pickle'
+    output:
+        result = 'output/result-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.h5'
+    shell:
+        'python {input.script} --input-file {input.data} \
+                               --input-h5 {input.h5} \
+                               --input-json {input.json} \
+                               --input-history {input.history} \
+                               --output-result {output.result}'
+
+rule evaluate_ptq:
+    input:
+        script = 'evaluate.py',
+        data = expand(rules.prepare_data.output, events=-1),
+        h5 = 'output/model-{model}-{latent_dim}-b{beta}-q0-{pruning}.h5',
+        json = 'output/model-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.json',
+        history = 'output/history-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.pickle'
+    output:
+        result = 'output/ptq-result-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.h5'
+    shell:
+        'python {input.script} --input-file {input.data} \
+                               --input-h5 {input.h5} \
+                               --input-json {input.json} \
+                               --input-history {input.history} \
+                               --quant-size {wildcards.quant_size} \
+                               --output-result {output.result}'
+
+rule create_custom_model:
+    input:
+    output:
+        model_file = 'output/custom-{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.h5',
+        placeholder = temp('.custom-{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}')
+    shell:
+        'python create_custom_model.py --model {wildcards.model} \
+                               --latent-dim {wildcards.latent_dim} \
+                               --beta {wildcards.beta} \
+                               --pruning {wildcards.pruning} \
+                               --output-file {output.model_file} \
+                               --ptq {wildcards.ptq} \
+                               --quant-size {wildcards.quant_size} ;'
+        'touch {output.placeholder}'
+
+rule create_hls_config:
+    input:
+        script = 'create_hls_config.py',
+        model_file = 'output/custom-{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.h5'
+    output:
+        config = 'hls/{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}/config.pickle'
+    params:
+        folder = 'hls/{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}/'
+    shell:
+        'export PATH=/afs/cern.ch/work/e/egovorko/vivado:$PATH ;'
+        'python {input.script} --model-type {wildcards.model} \
+                               --latent-dim {wildcards.latent_dim} \
+                               --beta {wildcards.beta} \
+                               --pruning {wildcards.pruning} \
+                               --input-file {input.model_file} \
+                               --output-folder {params.folder} \
+                               --output-config {output.config} \
+                               --hardware xcvu9p-flgb2104-2-e \
+                               --quant-size {wildcards.quant_size}'
+
+rule test_and_build_hls_model:
+    input:
+        script = 'test_and_build_hls_model.py',
+        model_file = 'output/custom-{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}.h5',
+        config = 'hls/{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}/config.pickle'
+    output:
+        placeholder = temp('.hls-{ptq}-{model}-{latent_dim}-{beta}-{quant_size}-{pruning}')
+    params:
+        folder = 'hls/{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}/',
+        report = 'hls/{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}/report.pickle',
+        plots = 'hls/{ptq}-{model}-{latent_dim}-b{beta}-q{quant_size}-{pruning}/',
+    shell:
+        'mkdir -p {params.plots} ;'
+        'export PATH=/afs/cern.ch/work/e/egovorko/vivado:$PATH ;'
+        'python {input.script} --input-file {input.model_file} \
+                               --output-folder {params.folder} \
+                               --output-report {params.report} \
+                               --input-config {input.config} \
+                               --plots-dir {params.plots} \
+                               --build 1 \
+                               --hardware xcvu9p-flgb2104-2-e ;'
+        'touch {output.placeholder}'
+
+rule build_conv_models:
+    input:
+        conv_ae = 'hls/qat-conv_ae-8-b0-q4-pruned/report.pickle',
+        conv_vae = 'hls/ptq-conv_vae-8-b0.8-q8-pruned/report.pickle',
+
+rule build_dense_ae:
+    params:
+        dense_ae_quantized = 'output/custom-dense_ae-qkeras8.h5',
+        dense_ae_quantized_config = 'output/custom-dense_ae-qkeras8.pickle',
+        dense_ae_quantized_report = 'output/dense_ae_model_report.pickle',
+        dense_ae_quantized_folder = 'output/dense_ae/',
+        plots = 'hls/dense_ae'
+    shell:
+        'mkdir -p {params.dense_ae_quantized_folder} ;'
+        'mkdir -p {params.plots} ;'
+        'python test_and_build_hls_model.py --input-file {params.dense_ae_quantized} \
+                                   --input-config {params.dense_ae_quantized_config} \
+                                   --output-report {params.dense_ae_quantized_report} \
+                                   --output-folder {params.dense_ae_quantized_folder} \
+                                   --plots-dir {params.plots} \
+                                   --build 1 \
+                                   --hardware xcvu9p-flgb2104-2-e ;'
+
+rule build_dense_vae:
+    params:
+        dense_vae_quantized = '/eos/user/e/epuljak/forDelphes/CorrectDataResults/VAE_models/PTQ/VAE_encoder_PTQ_qkeras8',
+        dense_vae_quantized_config = 'output/config_dnn_vae.pickle',
+        dense_vae_quantized_report = 'hls/dense_vae_model_report.pickle',
+        dense_vae_quantized_folder = 'hls/dense_vae/',
+        plots = 'hls/dense_vae'
+    shell:
+        'mkdir -p {params.dense_vae_quantized_folder} ;'
+        'mkdir -p {params.plots} ;'
+        'python test_and_build_hls_model.py --input-file {params.dense_vae_quantized} \
+                                   --input-config {params.dense_vae_quantized_config} \
+                                   --output-report {params.dense_vae_quantized_report} \
+                                   --output-folder {params.dense_vae_quantized_folder} \
+                                   --plots-dir {params.plots} \
+                                   --build 1 \
+                                   --hardware xcvu9p-flgb2104-2-e ;'
+
+rule paper:
+    params:
+        conv_vae = 'output/model-conv_vae-8-b0.8-q0-pruned.h5',
+        conv_vae_results = 'output/result-conv_vae-8-b0.8-q0-pruned.h5',
+        conv_vae_results_quantized = 'output/ptq-result-conv_vae-8-b0.8-q8-pruned.h5',
+        #
+        conv_ae = 'output/model-conv_ae-8-b0-q0-pruned',
+        conv_ae_not_pruned = 'output/model-conv_ae-8-b0-q0-not_pruned',
+        conv_ae_results = 'output/result-conv_ae-8-b0-q0-pruned.h5',
+        conv_ae_results_quantized = 'output/result-conv_ae-8-b0-q4-pruned.h5',
+        #
+        dense_ae = '/eos/user/e/epuljak/forDelphes/CorrectDataResults/AE_models/AE_pruned',
+        dense_ae_not_pruned = '/eos/user/e/epuljak/forDelphes/CorrectDataResults/AE_models/AE_notpruned',
+        dense_ae_results = '/eos/user/e/epuljak/forDelphes/CorrectDataResults/AE_results/AE_result_pruned.h5',
+        dense_ae_results_quantized = '/eos/user/e/epuljak/forDelphes/CorrectDataResults/AE_results/QAT/AE_result_QAT_choosen8.h5',
+        #
+        dense_vae_results = '/eos/user/e/epuljak/forDelphes/CorrectDataResults/VAE_results/VAE_result_pruned.h5',
+        dense_vae_results_quantized = '/eos/user/e/epuljak/forDelphes/CorrectDataResults/VAE_results/PTQ/VAE_result_PTQ_choosen8.h5',
+        #
+        qcd = config['background'],
+        leptoquarks = config['leptoquarks'],
+        ato4l = config['ato4l'],
+        hChToTauNu = config['hChToTauNu'],
+        hToTauTau = config['hToTauTau'],
+        #
+        dense_ae_quantized_report = 'output/dense_ae_model_report.pickle',
+        dense_vae_quantized_report = 'hls/dense_vae_model_report.pickle',
+        #
+        conv_ae_quantized_report = 'hls/qat-conv_ae-8-b0-q4-pruned/report.pickle',
+        conv_vae_quantized_report = 'hls/ptq-conv_vae-8-b0.8-q8-pruned/report.pickle',
+    shell:
+        # 'python plotting/plot_features.py --files {params.qcd} {params.leptoquarks} {params.ato4l} {params.hChToTauNu} {params.hToTauTau};'
+        # 'python plotting/plot_rocs.py --ae {params.dense_ae_results} --vae {params.dense_vae_results};'
+        # 'python plotting/plot_rocs.py --ae {params.conv_ae_results} --vae {params.conv_vae_results};'
+        # 'python plotting/plot_quantized_rocs.py --ae {params.dense_ae_results_quantized} --vae {params.dense_vae_results_quantized};'
+        # 'python plotting/plot_quantized_rocs.py --ae {params.conv_ae_results_quantized} --vae {params.conv_vae_results_quantized};'
+        # 'python plotting/plot_ratios.py --model conv_vae;'
+        # 'python plotting/plot_ratios.py --model conv_vae --prefix ptq-;'
+        # 'python plotting/plot_ratios.py --model conv_ae;'
+        # 'python plotting/plot_ratios.py --model conv_ae --prefix ptq-;'
+        # 'python plotting/plot_layers_weights.py --model-path {params.conv_ae};'
+        # 'python plotting/plot_layers_weights.py --model-path {params.conv_ae_not_pruned};'
+        # 'python plotting/plot_layers_weights.py --model-path {params.dense_ae};'
+        # 'python plotting/plot_layers_weights.py --model-path {params.dense_ae_not_pruned};'
+        # 'python plotting/plot_z-score.py --results-file {params.conv_vae_results};'
+        # 'python plotting/plot_z-score.py --results-file {params.conv_ae_results};'
+        # 'python plotting/performance_numbers.py --ae {params.dense_ae_results} --vae {params.dense_vae_results};'
+        # 'python plotting/performance_numbers.py --ae {params.conv_ae_results} --vae {params.conv_vae_results};'
+        # 'python plotting/performance_numbers.py --ae {params.dense_ae_results_quantized} --vae {params.dense_vae_results_quantized} --quantized;'
+        # 'python plotting/performance_numbers.py --ae {params.conv_ae_results_quantized} --vae {params.conv_vae_results_quantized} --quantized;'
+        # 'python plotting/read_report.py --file {params.dense_ae_quantized_report};'
+        # 'python plotting/read_report.py --file {params.dense_vae_quantized_report};'
+        'python plotting/read_report.py --file {params.conv_ae_quantized_report};'
+        # 'python plotting/read_report.py --file {params.conv_vae_quantized_report};'
+
